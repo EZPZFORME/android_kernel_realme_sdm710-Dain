@@ -1,0 +1,195 @@
+name: Build Khaenriah Kernel
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Building xxKhaenriah Kernel for RMX1971
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+
+    env:
+      TZ: Africa/Cairo
+      USE_CCACHE: "true"
+      DEVICE_CODENAME: "RMX1971"
+      KERNEL_DEFCONFIG: sdm670-perf_defconfig
+      ANYKERNEL_REPO: https://github.com/dain09/AnyKernel3
+      ANYKERNEL_BRANCH: nonksu
+      CLANG_URL: "https://github.com/kdrag0n/proton-clang"
+      KERNEL_IMAGE: Image.gz-dtb
+      ARCH: arm64
+      SUBARCH: arm64
+      KBUILD_BUILD_USER: "dain09"
+      KBUILD_BUILD_HOST: "github-actions"
+      KERNEL_VERSION: "EOL"
+      KERNEL_VARIANT: "xx"
+
+    steps:
+      # ─── 1. Checkout 
+      - name: Checkout Kernel Source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      # ─── 2. ccache 
+      - name: Set up ccache
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          max-size: "2G"
+          key: build-kernel-proton-${{ env.DEVICE_CODENAME }}
+
+      # ─── 3. Dependencies 
+      - name: Install Build Dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            bc bison build-essential binutils ca-certificates cpio curl \
+            device-tree-compiler flex git git-lfs libssl-dev \
+            make python3 python-is-python3 unzip zip xz-utils \
+            libelf-dev libncurses5-dev libtinfo5 llvm lld \
+            gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi
+
+      # ─── 4. Toolchain 
+      - name: Download Proton Clang
+        run: |
+          git clone --depth=1 ${{ env.CLANG_URL }} clang
+          echo "$(pwd)/clang/bin" >> $GITHUB_PATH
+
+      # ─── 5. AnyKernel3 
+      - name: Clone AnyKernel3
+        run: |
+          git clone --depth=1 -b ${{ env.ANYKERNEL_BRANCH }} \
+            ${{ env.ANYKERNEL_REPO }} AnyKernel3
+
+      # ─── 6. KernelSU 
+      - name: Initialize KernelSU
+        run: |
+          echo ">>> Initializing KernelSU (backslashxx)..."
+          curl -LSs "https://raw.githubusercontent.com/backslashxx/KernelSU/master/kernel/setup.sh" | bash -s master
+          echo ">>> Done."
+
+      # ─── 7. Build time 
+      - name: Get Build Time
+        id: get_time
+        run: echo "TIME=$(date +%Y.%m.%d-%H%M)" >> $GITHUB_OUTPUT
+
+      # ─── 8. Build 
+      - name: Build Kernel
+        run: |
+          export PATH=$(pwd)/clang/bin:$PATH
+
+          echo ">>> Clang version: $(clang --version | head -1)"
+          echo ">>> CPUs: $(nproc --all)"
+
+          # ── Generate defconfig ──
+          echo ">>> Generating defconfig..."
+          make O=out \
+            ARCH=${{ env.ARCH }} \
+            ${{ env.KERNEL_DEFCONFIG }}
+
+          # ── Apply KernelSU configs ──
+          # Manual hooks mode: disable auto LSM hooks and kprobes
+          # since we patched the hooks manually into the kernel source
+          echo ">>> Applying KernelSU configs..."
+          ./scripts/config --file out/.config \
+            -e CONFIG_KSU \
+            -e CONFIG_KSU_FEATURE_SULOG \
+            -e CONFIG_KSU_FEATURE_ADBROOT \
+            -d CONFIG_KSU_KPROBES_KSUD \
+            -d CONFIG_KSU_LSM_SECURITY_HOOKS \
+            -d CONFIG_KSU_DEBUG \
+            -d CONFIG_KSU_EXTRAS \
+            -d CONFIG_KSU_TAMPER_SYSCALL_TABLE \
+            -d CONFIG_KSU_THRONE_TRACKER_ALWAYS_THREADED
+
+          # Sync config to resolve dependencies
+          make O=out \
+            ARCH=${{ env.ARCH }} \
+            olddefconfig
+
+          echo ">>> KSU config status:"
+          grep -E "CONFIG_KSU" out/.config || true
+
+          # ── Compile ──
+          echo ">>> Compiling..."
+          make O=out -j$(nproc --all) \
+            ARCH=${{ env.ARCH }} \
+            SUBARCH=${{ env.SUBARCH }} \
+            LLVM=1 \
+            LLVM_IAS=1 \
+            CC="ccache clang" \
+            HOSTCC=gcc \
+            HOSTCXX=g++ \
+            LD=ld.lld \
+            AR=llvm-ar \
+            NM=llvm-nm \
+            OBJCOPY=llvm-objcopy \
+            OBJDUMP=llvm-objdump \
+            STRIP=llvm-strip \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
+            KBUILD_BUILD_USER=${{ env.KBUILD_BUILD_USER }} \
+            KBUILD_BUILD_HOST=${{ env.KBUILD_BUILD_HOST }} 
+            2>&1 | tee build.log
+
+          if [ ! -f out/arch/${{ env.ARCH }}/boot/${{ env.KERNEL_IMAGE }} ]; then
+            echo "Build Failed! Image not found."
+            exit 1
+          fi
+          echo "Build successful!"
+
+      # ─── 9. Upload log on failure 
+      - name: 📋 Upload Build Log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build.log
+
+      # ─── 10. Package 
+      - name: Package Kernel
+        run: |
+          cp out/arch/${{ env.ARCH }}/boot/${{ env.KERNEL_IMAGE }} AnyKernel3/
+
+          ZIP_NAME="Khaenriah-${{ env.KERNEL_VERSION }}-${{ env.KERNEL_VARIANT }}-KSU-${{ env.DEVICE_CODENAME }}-${{ steps.get_time.outputs.TIME }}.zip"
+
+          cd AnyKernel3
+          zip -r9 "../${ZIP_NAME}" ./* -x "*.git*" -x "README.md"
+          cd ..
+
+          echo "ZIP_NAME=${ZIP_NAME}" >> $GITHUB_ENV
+
+      # ─── 11. Release 
+      - name: Release
+        uses: softprops/action-gh-release@v2
+        with:
+          token: ${{ secrets.GH_PAT }}
+          tag_name: "Khaenriah-Kernel-${{ env.KERNEL_VERSION }}-${{ steps.get_time.outputs.TIME }}"
+          name: "Khaenriah Kernel | ${{ env.DEVICE_CODENAME }} | ${{ steps.get_time.outputs.TIME }}"
+          body: |
+            ## Khaenriah Kernel ${{ env.KERNEL_VERSION }} - ${{ env.KERNEL_VARIANT }}
+
+            | Info | Details |
+            |------|---------|
+            | Device | ${{ env.DEVICE_CODENAME }} |
+            | Compiler | Proton Clang |
+            | KernelSU | backslashxx/KernelSU |
+            | Branch | ${{ github.ref_name }} |
+            | Commit | ${{ github.sha }} |
+            | Build Date | ${{ steps.get_time.outputs.TIME }} |
+
+            ### KSU Config
+            - `CONFIG_KSU=y` — KernelSU enabled
+            - `CONFIG_KSU_KPROBES_KSUD=n` — Manual hooks mode
+            - `CONFIG_KSU_LSM_SECURITY_HOOKS=n` — Manual security hooks
+            - `CONFIG_KSU_FEATURE_SULOG=y`
+            - `CONFIG_KSU_FEATURE_ADBROOT=y`
+
+            ### Changes
+            ${{ github.event.head_commit.message }}
+          files: ${{ env.ZIP_NAME }}
+          draft: false
+          prerelease: false
